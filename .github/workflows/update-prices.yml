@@ -1,0 +1,78 @@
+name: 每日更新材料价格
+
+# 作用：GitHub Pages 是纯静态站点，没有后端接口。
+# 页面上的「同步最新价」读取的是仓库里的静态文件 prices.json。
+# 本工作流在 GitHub 服务器上每天收盘后自动运行 price_sync.py，
+# 抓取 SMM 电解铜 / 我的钢铁网镀锌板 / 上海金属网母线槽铜价，
+# 成功时把最新的 prices.json 提交并推回仓库，GitHub Pages 随后自动发布。
+# 这样线上价格始终保持最新，无需你本机一直开机。
+
+on:
+  schedule:
+    # 10:00 UTC = 18:00 北京时间（收盘后当日价已稳定）
+    - cron: '0 10 * * *'
+  workflow_dispatch: {}   # 允许在 Actions 页面手动点「Run workflow」立即刷新
+
+permissions:
+  contents: write        # 允许本工作流把 prices.json 推回仓库
+
+concurrency:
+  group: update-prices
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout 仓库
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true   # 保留令牌，后续 git push 才能成功
+
+      - name: 配置 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: 抓取最新价格（price_sync.py 仅用标准库）
+        run: python price_sync.py
+
+      - name: 校验并在抓取成功时提交
+        run: |
+          python - <<'PY'
+          import json, subprocess, sys, os
+
+          try:
+              with open('prices.json', encoding='utf-8') as f:
+                  data = json.load(f)
+          except Exception as e:
+              print('prices.json 解析失败：', e)
+              sys.exit(1)
+
+          cu = (data.get('copper') or {})
+          sh = (data.get('shmet') or {})
+          # 抓取未成功时，保留上次有效数据，本次不提交（避免把错误写上线）
+          if cu.get('status') != 'ok' or sh.get('status') != 'ok':
+              print('抓取未成功，保留上次有效数据，本次不提交。'
+                    ' copper=%s shmet=%s' % (cu.get('status'), sh.get('status')))
+              sys.exit(0)
+
+          if not os.path.isdir('.git'):
+              print('当前不是 git 仓库，跳过提交。')
+              sys.exit(0)
+
+          subprocess.run(['git', 'add', 'prices.json'], check=True)
+          out = subprocess.run(['git', 'status', '--porcelain', 'prices.json'],
+                               capture_output=True, text=True)
+          if not out.stdout.strip():
+              print('价格无变化，无需提交。')
+              sys.exit(0)
+
+          subprocess.run(['git', 'config', 'user.name', 'github-actions'], check=True)
+          subprocess.run(['git', 'config', 'user.email', 'github-actions@github.com'], check=True)
+          msg = 'chore: 自动更新材料价格 ' + (data.get('updated') or '')
+          subprocess.run(['git', 'commit', '-m', msg], check=True)
+          subprocess.run(['git', 'push'], check=True)
+          print('已提交并推送最新价格，updated=%s' % data.get('updated'))
+          PY
